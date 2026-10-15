@@ -1,5 +1,5 @@
 /* Sightline service worker: works offline, and refreshes files in the background each time you are online. */
-const CACHE = 'sightline-v1';
+const CACHE = 'sightline-v2';
 const ASSETS = ['./', 'index.html', 'css/style.css', 'js/astronomy.browser.min.js', 'js/data.js', 'js/geo.js', 'js/engine.js',
   'js/store.js', 'js/chart.js', 'js/capture.js', 'js/app.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
 

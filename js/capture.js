@@ -44,6 +44,7 @@
     window.removeEventListener('resize', resize);
     window.removeEventListener('deviceorientationabsolute', st.hAbs, true);
     window.removeEventListener('deviceorientation', st.hRel, true);
+    window.removeEventListener('devicemotion', st.hMot, true);
     if (st.stream) st.stream.getTracks().forEach(t => t.stop());
     if (st.wake) st.wake.release().catch(() => {});
     const v = $('capVideo'); v.srcObject = null;
@@ -55,20 +56,35 @@
 
   /* ---------- sensors and camera ---------- */
   function startSensors() {
+    // Persist the gyro check across openings so the fast tracking starts straight away next time.
+    const known = (() => { try { return JSON.parse(localStorage.getItem('sightline.gyro') || 'null'); } catch (e) { return null; } })();
+    st.F = geo.makeFusion();
+    if (known && known.gyro === 'on') { st.F.gyro = 'on'; st.F.scale = known.scale; }
+    const now = () => performance.now() / 1000;
     const feed = e => {
       const M = geo.eulerToMatrix(e.alpha, e.beta, e.gamma);
-      st.Rs = st.Rs ? geo.blendMatrix(st.Rs, M, 0.35) : M;
+      const before = st.F.gyro;
+      st.Rs = geo.fusionMeasure(st.F, M, now());
+      if (before === 'unknown' && st.F.gyro !== 'unknown') {
+        try { localStorage.setItem('sightline.gyro', JSON.stringify({ gyro: st.F.gyro, scale: st.F.scale })); } catch (err) { /* ignore */ }
+      }
     };
     st.hAbs = e => { if (e.alpha == null || e.beta == null) return; st.absolute = true; feed(e); };
-    st.hRel = e => { if (st.absolute || e.alpha == null || e.beta == null) return; st.relOnly = true; feed(e); };
+    st.hRel = e => { if (st.absolute || e.alpha == null || e.beta == null) return; st.relOnly = !e.absolute; feed(e); };
+    st.hMot = e => {
+      const r = e.rotationRate; if (!r || r.alpha == null) return;
+      geo.fusionGyro(st.F, [r.beta, r.gamma, r.alpha], now());
+      if (st.F.gyro === 'on') st.Rs = st.F.R;
+    };
     window.addEventListener('deviceorientationabsolute', st.hAbs, true);
     window.addEventListener('deviceorientation', st.hRel, true);
+    window.addEventListener('devicemotion', st.hMot, true);
     if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
       DeviceOrientationEvent.requestPermission().catch(() => {});
     }
     setTimeout(() => {
       if (!st) return;
-      if (!st.Rs) banner('No motion-sensor data. In Chrome, open Site settings and allow Motion sensors for this site.');
+      if (!st.Rs) banner('No motion-sensor data. Allow motion sensors for this site in your browser\'s site settings (Chrome works best).');
       else if (!st.absolute && st.relOnly) banner('This browser only gives a relative compass. Use Align on the Sun, Moon or a bright star each time you open this screen.');
     }, 1800);
   }
@@ -82,12 +98,21 @@
       v.srcObject = stream;
       await v.play().catch(() => {});
       st.videoOK = true;
+      if (st.bannerKind === 'camera') banner(null);
     } catch (e) {
-      banner(e && e.name === 'NotAllowedError' ? 'Camera blocked. Allow camera access for this site in Chrome settings, then reopen this screen.' : 'Camera unavailable: ' + (e && e.message ? e.message : 'unknown error'));
+      if (!st) return;
+      const blocked = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+      banner(blocked ? 'Camera not allowed. Tap here to try again, or allow the camera for this site in your browser\'s site settings.' : 'Camera unavailable: ' + (e && e.message ? e.message : 'unknown error') + '. Tap to try again.', 'camera');
+      $('capBanner').onclick = () => { if (st && !st.videoOK) { banner(null); startCamera(); } };
     }
   }
 
-  function banner(text) { const b = $('capBanner'); if (!text) { b.hidden = true; return; } b.textContent = text; b.hidden = false; }
+  function banner(text, kind) {
+    const b = $('capBanner');
+    if (st) st.bannerKind = text ? (kind || 'info') : null;
+    if (!text) { b.hidden = true; b.onclick = null; return; }
+    b.textContent = text; b.hidden = false;
+  }
   function resize() {
     if (!st) return;
     const cap = $('cap'), c = $('capOverlay'), dpr = Math.min(window.devicePixelRatio || 1, 3);
@@ -128,7 +153,7 @@
   /* ---------- modes and panels ---------- */
   function setMode(m) {
     if (m !== 'photo' && st.still) clearStill();
-    st.mode = m; st.sweep = false;
+    st.mode = m; st.sweep = false; st.pending = null;
     document.querySelectorAll('#capTabs button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.m === m)));
     renderPanel();
   }
@@ -151,7 +176,7 @@
         <p id="lensInfo">Field of view now: <b>${fovNow()}°</b> across the screen.</p>`;
     } else if (st.mode === 'trace') {
       p.innerHTML = `
-        <p id="traceHint">Aim the cross-hair at the <b>top edge</b> of trees, fences and roofs, then tap Add. You can also tap the screen right on the edge. Work around the horizon in one direction.</p>
+        <p id="traceHint">Aim the cross-hair at the <b>top edge</b> of trees, fences and roofs and tap Add. It waits until the phone is still, then turns green and records the point. Work around the horizon in one direction.</p>
         <div class="shutter-row"><button class="btn" id="tUndo">Undo</button><button class="shutter" id="tAdd" aria-label="Add point">Add</button><button class="btn" id="tSweep" aria-pressed="false">Sweep</button></div>
         <div class="btn-row"><button class="btn primary" id="tDone" disabled>Save line</button></div>`;
       updateTrace();
@@ -187,6 +212,45 @@
 
   /* ---------- actions ---------- */
   const crosshair = () => st.Rs ? geo.applyCalib(geo.pointing(st.Rs), st.calib) : null;
+
+  /* Steadiness: keep ~1 s of where the camera pointed. A capture waits until the last 0.35 s
+     stayed within half a degree, then uses the average, so hand shake and sensor lag drop out. */
+  const STEADY_WIN = 0.35, STEADY_DEG = 0.5, STEADY_WAIT = 2.5;
+  function track(t) {
+    if (!st.Rs) return;
+    const p = geo.pointing(st.Rs), h = st.hist || (st.hist = []);
+    h.push({ t, az: p.az, alt: p.alt });
+    while (h.length && t - h[0].t > 1.2) h.shift();
+  }
+  function steadyNow(t) {
+    const h = st.hist || [], recent = h.filter(s => t - s.t <= STEADY_WIN);
+    if (!recent.length || t - recent[0].t < STEADY_WIN * 0.7) return { steady: false, p: null };
+    const m = geo.meanDir(recent);
+    return { steady: m.spread < STEADY_DEG, p: { az: m.az, alt: m.alt } };
+  }
+  function speedNow(t) { // degrees per second over the last 0.2 s
+    const h = st.hist || []; if (h.length < 2) return 0;
+    const a = h.find(s => t - s.t <= 0.2) || h[0], b = h[h.length - 1];
+    return b.t > a.t ? geo.angleBetween(a.az, a.alt, b.az, b.alt) / (b.t - a.t) : 0;
+  }
+  function whenSteady(btn, fn) {
+    if (st.pending) return;
+    st.pending = { t0: performance.now() / 1000, fn, btn, label: btn.textContent };
+    btn.textContent = 'Hold still';
+    btn.classList.add('waiting');
+  }
+  function servicePending(t) {
+    const pd = st.pending; if (!pd) return;
+    const s = steadyNow(t);
+    const late = t - pd.t0 > STEADY_WAIT;
+    if (!s.steady && !late) return;
+    st.pending = null;
+    if (pd.btn.isConnected) { pd.btn.textContent = pd.label; pd.btn.classList.remove('waiting'); }
+    const p = s.steady ? s.p : (s.p || geo.pointing(st.Rs));
+    if (!s.steady) toast('The phone kept moving, so that may be a little off. Undo it if it looks wrong.');
+    if (navigator.vibrate) try { navigator.vibrate(15); } catch (e) { /* ignore */ }
+    pd.fn(p);
+  }
 
   function addPoint(p) {
     st.cur.push([Math.round(p.az * 10) / 10, Math.round(clamp(p.alt, 0, 89.5) * 10) / 10]);
@@ -259,26 +323,21 @@
       if (b.parentElement && b.parentElement.id === 'alignChips') { st.targetKey = b.dataset.k; renderPanel(); return; }
       if (id === 'alignGo') {
         const t = target(); if (!t || !st.Rs) return toast('Waiting for the compass.');
-        const c = geo.calibFromTarget(geo.pointing(st.Rs), t);
-        st.calib = { azOff: c.azOff, altOff: c.altOff, at: Date.now(), target: t.name };
-        st.opts.onCalib(st.calib); toast(`Aligned on ${t.name}: compass was ${fmtDeg(-c.azOff)} off.`); renderPanel();
+        whenSteady(b, p => {
+          const c = geo.calibFromTarget(p, t);
+          st.calib = { azOff: c.azOff, altOff: c.altOff, at: Date.now(), target: t.name };
+          st.opts.onCalib(st.calib); toast(`Aligned on ${t.name}: compass was ${fmtDeg(-c.azOff)} off.`); renderPanel();
+        });
       } else if (id === 'alignReset') {
         st.calib = { azOff: 0, altOff: 0, at: 0, target: '' }; st.opts.onCalib(st.calib); renderPanel();
       } else if (id === 'lensMark') {
         if (!st.Rs) return toast('Waiting for the compass.');
-        const p = geo.pointing(st.Rs);
-        if (!st.lens.left) { st.lens.left = p; renderPanel(); toast('Now turn so the landmark is on the right guide.'); return; }
-        const A = geo.angleBetween(st.lens.left.az, st.lens.left.alt, p.az, p.alt);
-        const half = (0.5 - 0.12) * st.W, fcss = half / Math.tan((A / 2) * Math.PI / 180);
-        const hfov = 2 * Math.atan(st.W / 2 / fcss) * 180 / Math.PI;
-        if (!(A > 8 && hfov > 25 && hfov < 120)) { st.lens.left = null; renderPanel(); return toast('That did not look right. Try again, turning slowly in a flat sweep.'); }
-        const v = $('capVideo');
-        st.opts.onFnorm(geo.fnormFromHfov(hfov, st.W, st.H, v.videoWidth, v.videoHeight));
-        st.lens.left = null; renderPanel(); toast(`Field of view set to ${hfov.toFixed(0)}°.`);
+        whenSteady(b, lensMark);
       } else if (id === 'lensReset') {
         st.lens.left = null; st.opts.onFnorm(0.74); renderPanel();
       } else if (id === 'tAdd') {
-        const p = crosshair(); if (!p) return toast('Waiting for the compass.'); addPoint(p);
+        if (!st.Rs) return toast('Waiting for the compass.');
+        whenSteady(b, p => addPoint(geo.applyCalib(p, st.calib)));
       } else if (id === 'tUndo') {
         st.cur.pop(); updateTrace();
       } else if (id === 'tSweep') {
@@ -293,6 +352,16 @@
       else if (id === 'pRetake') clearStill();
       else if (id === 'pSave') saveStill();
     };
+    function lensMark(p) {
+        if (!st.lens.left) { st.lens.left = p; renderPanel(); toast('Now turn so the landmark is on the right guide.'); return; }
+        const A = geo.angleBetween(st.lens.left.az, st.lens.left.alt, p.az, p.alt);
+        const half = (0.5 - 0.12) * st.W, fcss = half / Math.tan((A / 2) * Math.PI / 180);
+        const hfov = 2 * Math.atan(st.W / 2 / fcss) * 180 / Math.PI;
+        if (!(A > 8 && hfov > 25 && hfov < 120)) { st.lens.left = null; renderPanel(); return toast('That did not look right. Try again, turning slowly in a flat sweep.'); }
+        const v = $('capVideo');
+        st.opts.onFnorm(geo.fnormFromHfov(hfov, st.W, st.H, v.videoWidth, v.videoHeight));
+        st.lens.left = null; renderPanel(); toast(`Field of view set to ${hfov.toFixed(0)}°.`);
+    }
     $('capPanel').oninput = e => { if (e.target.id === 'pSens' && st.still) { st.still.sens = +e.target.value; clearTimeout(st.sensT); st.sensT = setTimeout(() => { if (st && st.still) autoDetect(); }, 120); } };
 
     const ov = $('capOverlay');
@@ -322,8 +391,16 @@
     const ctx = st.ctx, W = st.W, H = st.H;
     ctx.clearRect(0, 0, W, H);
     const R = st.still ? st.still.R : st.Rs;
-    const cross = crosshair();
-    $('capReadout').textContent = cross ? `Az ${cross.az.toFixed(1)}°  Alt ${cross.alt.toFixed(1)}°` : 'Waiting for compass…';
+    const cross = crosshair(), t = performance.now() / 1000;
+    if (!st.still) track(t);
+    servicePending(t);
+    st.speed = speedNow(t);
+    st.steady = steadyNow(t).steady;
+    const tooFast = st.mode === 'trace' && st.sweep && st.speed > SWEEP_MAX;
+    $('capReadout').textContent = !cross ? 'Waiting for compass…'
+      : st.pending ? 'Hold still…'
+      : tooFast ? 'Slow down'
+      : `Az ${cross.az.toFixed(1)}°  Alt ${cross.alt.toFixed(1)}°`;
     if (st.mode === 'align' && Date.now() - st.targetsAt > 8000) computeTargets();
     if (R) {
       const view = st.still ? st.still.view : currentView();
@@ -333,8 +410,9 @@
       if (st.mode === 'lens') drawLens(ctx);
       if (st.mode === 'photo' && st.still) drawStillStrokes(ctx);
     }
-    if (!st.still) drawCrosshair(ctx, W / 2, H / 2);
+    if (!st.still) drawCrosshair(ctx, W / 2, H / 2, st.pending ? '#ffd66b' : (st.steady && st.mode !== 'photo') ? '#6ed3a2' : '#fff');
   }
+  const SWEEP_MAX = 15; // deg/s; faster than this and Sweep skips points
 
   function drawHorizon(ctx, R, view) {
     const calib = st.calib, mask = st.opts.getMask ? st.opts.getMask() : null;
@@ -359,8 +437,8 @@
     ctx.textAlign = 'start';
   }
 
-  function drawCrosshair(ctx, x, y) {
-    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+  function drawCrosshair(ctx, x, y, color) {
+    ctx.strokeStyle = color || '#fff'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI * 2); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x - 30, y); ctx.lineTo(x - 8, y); ctx.moveTo(x + 8, y); ctx.lineTo(x + 30, y);
     ctx.moveTo(x, y - 30); ctx.lineTo(x, y - 8); ctx.moveTo(x, y + 8); ctx.lineTo(x, y + 30); ctx.stroke();
@@ -391,7 +469,7 @@
 
   function drawTrace(ctx, R, view, cross) {
     const accent = '#ffd66b';
-    if (st.sweep && cross) {
+    if (st.sweep && cross && st.speed <= SWEEP_MAX) {
       const l = st.lastAdd;
       if (!l || Math.abs(wrap180(cross.az - l.az)) >= 2.5 || Math.abs(cross.alt - l.alt) >= 3) addPoint(cross);
     }

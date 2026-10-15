@@ -84,6 +84,102 @@
   function blendMatrix(A, B, t) {
     return orthonormalize(A.map((r, i) => r.map((x, j) => x + (B[i][j] - x) * t)));
   }
+  // rotation matrix for a rotation vector w (radians), Rodrigues
+  function rotExp(w) {
+    const th = Math.hypot(w[0], w[1], w[2]);
+    if (th < 1e-9) return [[1, -w[2], w[1]], [w[2], 1, -w[0]], [-w[1], w[0], 1]];
+    const x = w[0] / th, y = w[1] / th, z = w[2] / th, c = Math.cos(th), s = Math.sin(th), C = 1 - c;
+    return [[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+            [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+            [z * x * C - y * s, z * y * C + x * s, c + z * z * C]];
+  }
+  // rotation vector (radians) of a rotation matrix
+  function rotLog(R) {
+    const th = Math.acos(clamp((R[0][0] + R[1][1] + R[2][2] - 1) / 2, -1, 1));
+    const v = [R[2][1] - R[1][2], R[0][2] - R[2][0], R[1][0] - R[0][1]];
+    if (th < 1e-6) return [v[0] / 2, v[1] / 2, v[2] / 2];
+    const k = th / (2 * Math.sin(th));
+    return [v[0] * k, v[1] * k, v[2] * k];
+  }
+  const rotAngle = (A, B) => { // degrees between two orientations
+    const M = mul(transpose(A), B);
+    return Math.acos(clamp((M[0][0] + M[1][1] + M[2][2] - 1) / 2, -1, 1)) * R2D;
+  };
+
+  /* ---------- sensor fusion ----------
+     Orientation events alone lag behind the camera (Android fuses the compass slowly, and some
+     browsers deliver them late), so the overlay drags along with the phone. The gyroscope
+     (devicemotion.rotationRate) is fast but drifts. Complementary filter: integrate the gyro for
+     motion, and pull gently toward the orientation reading for absolute direction.
+     The gyro is only trusted after its units and axes have been checked against the orientation
+     readings while the phone moves (browsers have differed: deg/s vs rad/s). */
+  const LAGS = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.25, 0.3, 0.35, 0.4], LAG_MAX = 0.4;
+  function makeFusion() {
+    return { R: null, gyro: 'unknown', scale: 1, rate: 0, tg: null, tm: null,
+      win: null, sxy: 0, sxx: 0, syy: 0, moved: 0, n: 0 };
+  }
+  // rr: rotationRate as [beta, gamma, alpha] = rates about device x, y, z (raw units); t in seconds
+  function fusionGyro(F, rr, t) {
+    if (!rr || rr.some(v => v == null || !isFinite(v))) return;
+    const dt = F.tg == null ? 0 : t - F.tg;
+    F.tg = t;
+    if (!(dt > 0 && dt < 0.2)) return;
+    if (F.win) F.win.G = mul(F.win.G, rotExp([rr[0] * D2R * dt, rr[1] * D2R * dt, rr[2] * D2R * dt]));
+    if (F.gyro !== 'on' || !F.R) return;
+    const s = F.scale * D2R * dt;
+    F.rate = Math.hypot(rr[0], rr[1], rr[2]) * F.scale;
+    F.R = orthonormalize(mul(F.R, rotExp([rr[0] * s, rr[1] * s, rr[2] * s])));
+  }
+  function fusionMeasure(F, Rm, t) {
+    if (!F.R) { F.R = Rm; F.tm = t; return F.R; }
+    const dt = Math.max(0, Math.min(0.5, t - (F.tm == null ? t : F.tm)));
+    F.tm = t;
+    if (F.gyro === 'unknown') checkGyro(F, Rm, t);
+    if (F.gyro === 'on' && F.tg != null && t - F.tg < 0.5) {
+      if (rotAngle(F.R, Rm) > 25) { F.R = Rm; F.hist = []; return F.R; } // lost track: resync
+      // The reading describes where the phone was `lag` seconds ago. Estimate that lag while the
+      // phone turns, then carry the reading forward by the gyro motion since then.
+      const H = F.hist || (F.hist = []);
+      H.push({ t, R: F.R });
+      while (H.length && t - H[0].t > LAG_MAX + 0.1) H.shift();
+      const at = s => { let best = H[H.length - 1]; for (const h of H) if (Math.abs(h.t - s) < Math.abs(best.t - s)) best = h; return best.R; };
+      if (!F.lagErr) F.lagErr = LAGS.map(() => 0);
+      if (F.rate > 8 && H[0] && t - H[0].t > LAG_MAX - 0.02) {
+        LAGS.forEach((L, i) => { F.lagErr[i] += (rotAngle(at(t - L), Rm) - F.lagErr[i]) * 0.05; });
+        let bi = 0; LAGS.forEach((L, i) => { if (F.lagErr[i] < F.lagErr[bi]) bi = i; });
+        F.lag = LAGS[bi];
+      }
+      const lag = F.lag || 0, past = at(t - lag);
+      const target = lag ? mul(Rm, mul(transpose(past), F.R)) : Rm;
+      // trust the gyro more while turning, the compass more when still
+      const tau = F.rate > 25 ? 1.5 : F.rate > 6 ? 0.9 : 0.45;
+      F.R = blendMatrix(F.R, target, 1 - Math.exp(-dt / tau));
+    } else {
+      F.R = blendMatrix(F.R, Rm, 0.35);
+      F.rate = 0;
+    }
+    return F.R;
+  }
+  function checkGyro(F, Rm, t) {
+    const I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    if (!F.win) { F.win = { R0: Rm, t0: t, G: I }; return; }
+    if (t - F.win.t0 < 0.25) return;
+    const vm = rotLog(mul(transpose(F.win.R0), Rm)).map(v => v * R2D);
+    const vg = rotLog(F.win.G).map(v => v * R2D);
+    const am = Math.hypot(vm[0], vm[1], vm[2]);
+    if (am > 2 && am < 120) {
+      F.sxy += dot(vm, vg); F.sxx += dot(vg, vg); F.syy += dot(vm, vm); F.moved += am; F.n++;
+    }
+    F.win = { R0: Rm, t0: t, G: I };
+    if (F.moved < 45 || F.n < 4) return;
+    const corr = F.sxy / Math.sqrt(F.sxx * F.syy || 1), k = F.sxy / (F.sxx || 1e-9);
+    if (corr > 0.75 && k > 0.6 && k < 1.7) { F.gyro = 'on'; F.scale = 1; }
+    else if (corr > 0.75 && k > 35 && k < 95) { F.gyro = 'on'; F.scale = R2D; }
+    else if (F.moved > 240) F.gyro = 'off';
+    else return;
+    F.win = null;
+  }
+
   function dirToAzAlt(e) {
     const n = vnorm(e);
     return { az: wrap360(Math.atan2(n[0], n[1]) * R2D), alt: Math.asin(clamp(n[2], -1, 1)) * R2D };
@@ -94,6 +190,16 @@
   }
   // where the back camera is pointing (sensor frame, before calibration)
   function pointing(R) { return dirToAzAlt([-R[0][2], -R[1][2], -R[2][2]]); }
+  // average of several {az, alt} directions, and their spread (max degrees from the mean)
+  function meanDir(list) {
+    if (!list.length) return null;
+    const s = [0, 0, 0];
+    list.forEach(p => { const d = azAltToDir(p.az, p.alt); s[0] += d[0]; s[1] += d[1]; s[2] += d[2]; });
+    const m = dirToAzAlt(s);
+    let spread = 0;
+    list.forEach(p => { spread = Math.max(spread, angleBetween(m.az, m.alt, p.az, p.alt)); });
+    return { az: m.az, alt: m.alt, spread };
+  }
   function angleBetween(az1, alt1, az2, alt2) {
     return Math.acos(clamp(dot(azAltToDir(az1, alt1), azAltToDir(az2, alt2)), -1, 1)) * R2D;
   }
@@ -191,6 +297,7 @@
   return {
     D2R, R2D, wrap360, wrap180, clamp, buildMask, maskAt, eulerToMatrix, orthonormalize, blendMatrix,
     pointing, dirToAzAlt, azAltToDir, angleBetween, applyCalib, calibFromTarget, makeView,
-    fnormFromHfov, pixelToAzAlt, azAltToPixel, detectSkyline, mulv, transpose, mul
+    fnormFromHfov, pixelToAzAlt, azAltToPixel, detectSkyline, mulv, transpose, mul,
+    rotExp, rotLog, rotAngle, makeFusion, fusionGyro, fusionMeasure, meanDir
   };
 });

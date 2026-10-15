@@ -204,6 +204,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .shutter-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .shutter { width: 72px; height: 72px; border-radius: 50%; border: 4px solid #fff; background: var(--accent); color: var(--accent-fg); font-weight: 700; flex: none; }
 .shutter:active { transform: scale(.94); }
+.shutter.waiting, .btn.waiting { opacity: .7; }
+.cap-banner { cursor: pointer; }
 .shutter-row .btn { min-width: 84px; }
 .guide { font: 600 17px var(--font-ui); color: #fff; text-shadow: 0 1px 3px #000; }
 .lock { color: var(--good); }
