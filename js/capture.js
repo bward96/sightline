@@ -32,7 +32,8 @@
     startCamera();
     bind();
     setMode(st.mode);
-    if (navigator.wakeLock && navigator.wakeLock.request) navigator.wakeLock.request('screen').then(w => { st && (st.wake = w); }).catch(() => {});
+    if (window.SightlineAndroid) window.SightlineAndroid.keepScreenOn(true);
+    else if (navigator.wakeLock && navigator.wakeLock.request) navigator.wakeLock.request('screen').then(w => { st && (st.wake = w); }).catch(() => {});
     st.raf = requestAnimationFrame(frame);
   }
 
@@ -47,6 +48,7 @@
     window.removeEventListener('devicemotion', st.hMot, true);
     if (st.stream) st.stream.getTracks().forEach(t => t.stop());
     if (st.wake) st.wake.release().catch(() => {});
+    if (window.SightlineAndroid) window.SightlineAndroid.keepScreenOn(false);
     const v = $('capVideo'); v.srcObject = null;
     $('capStill').hidden = true;
     $('cap').hidden = true;

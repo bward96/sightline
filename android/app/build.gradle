@@ -1,0 +1,48 @@
+plugins { id 'com.android.application' }
+
+// The web app lives at the repository root; copy it into the APK's assets at build time,
+// so every build ships the same app as the website.
+def webRoot = rootProject.file('..')
+def wwwOut = layout.buildDirectory.dir('generated/www')
+tasks.register('copyWebApp', Copy) {
+    from(webRoot) {
+        include 'index.html', 'manifest.webmanifest', 'css/**', 'js/**', 'icons/**', 'THIRD-PARTY.md'
+    }
+    into wwwOut.map { it.dir('www') }
+}
+preBuild.dependsOn 'copyWebApp'
+
+android {
+    namespace 'io.github.bward96.sightline'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'io.github.bward96.sightline'
+        minSdk 24
+        targetSdk 34
+        versionCode (System.getenv('VERSION_CODE') ?: '1') as int
+        versionName '1.' + (System.getenv('VERSION_CODE') ?: '0')
+    }
+    sourceSets { main { assets.srcDirs += [wwwOut] } }
+    signingConfigs {
+        release {
+            storeFile rootProject.file('sightline.keystore')
+            storePassword System.getenv('KEYSTORE_PASSWORD') ?: 'sightline-public'
+            keyAlias 'sightline'
+            keyPassword System.getenv('KEYSTORE_PASSWORD') ?: 'sightline-public'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.11.0'
+}

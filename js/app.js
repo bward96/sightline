@@ -455,6 +455,7 @@
         else if (ck) { st.hour24 = ck.dataset.h === '1'; store.save(); appSheet(); refresh(); }
       };
       $('#bkSave', root).onclick = () => {
+        if (window.SightlineAndroid) { window.SightlineAndroid.saveText('sightline-backup.json', store.exportText()); return; }
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([store.exportText()], { type: 'application/json' }));
         a.download = 'sightline-backup.json'; document.body.appendChild(a); a.click(); a.remove();
@@ -570,7 +571,7 @@
   applyTheme();
   renderHeader();
   refresh();
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http') && !window.SightlineAndroid) {
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline support is optional */ });
   }
   window.SLApp = { S, refresh, setTab, eng };
