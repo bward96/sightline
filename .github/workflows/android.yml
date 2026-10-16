@@ -34,7 +34,7 @@ jobs:
         run: |
           set -o pipefail
           gradle --no-daemon --console=plain assembleRelease 2>&1 | tee build.log || {
-            # surface the real error as annotations (they are readable without downloading logs)
+            set +e  # surface the real error as annotations (readable without downloading logs)
             { grep -E "^e: |error:" build.log | head -15; grep -B2 -A12 "What went wrong" build.log; grep -A4 "^\* Where" build.log; } | head -45 | while IFS= read -r line; do [ -n "$line" ] && echo "::error::$line"; done
             exit 1
           }
