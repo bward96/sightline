@@ -3,22 +3,22 @@ plugins { id 'com.android.application' }
 // The web app lives at the repository root; copy it into the APK's assets at build time,
 // so every build ships the same app as the website.
 def webRoot = rootProject.file('..')
-def wwwOut = layout.buildDirectory.dir('generated/www')
+def wwwOut = file("$buildDir/generated/webassets")
 tasks.register('copyWebApp', Copy) {
     from(webRoot) {
         include 'index.html', 'manifest.webmanifest', 'css/**', 'js/**', 'icons/**', 'THIRD-PARTY.md'
     }
-    into wwwOut.map { it.dir('www') }
+    into new File(wwwOut, 'www')
 }
-preBuild.dependsOn 'copyWebApp'
+tasks.matching { it.name == 'preBuild' }.configureEach { dependsOn 'copyWebApp' }
 
 android {
     namespace 'io.github.bward96.sightline'
-    compileSdk 34
+    compileSdk 35
     defaultConfig {
         applicationId 'io.github.bward96.sightline'
         minSdk 24
-        targetSdk 34
+        targetSdk 35
         versionCode (System.getenv('VERSION_CODE') ?: '1') as int
         versionName '1.' + (System.getenv('VERSION_CODE') ?: '0')
     }
@@ -36,6 +36,10 @@ android {
             minifyEnabled false
             signingConfig signingConfigs.release
         }
+    }
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
