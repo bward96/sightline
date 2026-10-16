@@ -19,7 +19,7 @@ android {
         applicationId 'io.github.bward96.sightline'
         minSdk 24
         targetSdk 35
-        versionCode (System.getenv('VERSION_CODE') ?: '1') as int
+        versionCode Integer.parseInt(System.getenv('VERSION_CODE') ?: '1')
         versionName '1.' + (System.getenv('VERSION_CODE') ?: '0')
     }
     sourceSets { main { assets.srcDirs += [wwwOut] } }
